@@ -105,13 +105,10 @@ box_run_crontab() {
 
   if [ "${run_crontab}" = "true" ]; then
     log Debug "crond 已启用"
-    if [ "$update_subscription" = "true" ] || [ "$update_geo" = "true" ]; then
+    if [ "$update_subscription" = "true" ]; then
       log Debug "定时任务间隔: ${interva_update}."
-      echo "${interva_update} ${scripts_dir}/box.tool geosub" >> "${box_run}/root"
-      log Info "${bin_name} geox 更新: ${update_geo}."
-      if [ "${bin_name}" = "mihomo" ]; then
-        log Info "${bin_name} 订阅更新: ${update_subscription}."
-      fi
+      echo "${interva_update} ${scripts_dir}/box.tool subs" >> "${box_run}/root"
+      log Info "${bin_name} 订阅更新: ${update_subscription}."
     fi
     cat "${box_dir}/crontab.cfg" >> "${box_run}/root"
     chmod 0644 "${box_run}/root"
@@ -698,7 +695,7 @@ set_description() {
 
   case "$status" in
     running)
-      desc="✅ Box服务运行中 | 内核: ${bin_name} | 代理模式: ${proxy_mode} | 网络: ${network_mode} | IPv6状态: ${ipv6_info} | DNS模式: ${dns_mode}${wifissid_str}"
+      desc="✅ $current_time Box服务运行中 | 内核: ${bin_name} | 代理模式: ${proxy_mode} | 网络: ${network_mode} | IPv6状态: ${ipv6_info} | DNS模式: ${dns_mode}${wifissid_str}"
       ;;
     stopped)
       desc="❌ Box服务已停止 | 上次运行内核: ${bin_name} | 代理已禁用"

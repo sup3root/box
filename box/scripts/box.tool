@@ -2,7 +2,7 @@
 
 scripts_dir="${0%/*}"
 
-user_agent="box_for_root"
+user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
 source /data/adb/box/settings.ini
 
 # 使用 settings.ini 中提供的 log()
@@ -388,110 +388,6 @@ upgeox_all() {
   bin_name=$original_bin_name
 }
 
-# 更新 mihomo 配置的 proxy-providers
-update_mihomo_providers() {
-  yq="yq"
-  if ! command -v yq &>/dev/null; then
-    if [ ! -e "${box_dir}/bin/yq" ]; then
-      log Debug "yq 文件未找到, 开始从 GitHub 下载"
-      ${scripts_dir}/box.tool upyq
-    fi
-    yq="${box_dir}/bin/yq"
-  fi
-
-  if [ ! -f "${mihomo_config}" ]; then
-    log Error "配置文件不存在: ${mihomo_config}"
-    return 1
-  fi
-  cp "${mihomo_config}" "${mihomo_config}.bak" 2>/dev/null
-  local file_count=${#name_provide_mihomo_config[@]}
-  if [ "$file_count" -eq 0 ]; then
-    log Warning "没有配置的订阅文件"
-    return 1
-  fi
-
-  log Debug "开始更新 proxy-providers 配置项..."
-  local config_dir="$(dirname "${mihomo_config}")"  
-  
-  local temp_providers="${mihomo_config}.providers.tmp"
-  echo "proxy-providers:" > "${temp_providers}"
-  
-  for i in $(seq 0 $((file_count - 1))); do
-    local file_name="${name_provide_mihomo_config[$i]}"
-    local provider_file="${mihomo_provide_path}/${file_name}"
-    local provider_name="${file_name%.yaml}"    
-    
-    [ ! -f "${provider_file}" ] && log Warning "订阅文件不存在，跳过: ${provider_file}" && continue
-    
-    local relative_path
-    if command -v realpath >/dev/null 2>&1; then
-      relative_path="$(realpath --relative-to="${config_dir}" "${provider_file}")"
-    else
-      relative_path="./$(basename "${mihomo_provide_path}")/${file_name}"
-    fi
-
-    log Debug "添加 provider: ${provider_name} -> ${relative_path}"
-    
-    cat >> "${temp_providers}" <<EOF
-  ${provider_name}:
-    type: file
-    path: ${relative_path}
-    health-check:
-      enable: true
-      url: https://cp.cloudflare.com
-      interval: 300
-      timeout: 1000
-      tolerance: 100
-EOF
-  done
-  
-  local temp_output="${mihomo_config}.output.tmp"
-  
-  awk -v new_providers="${temp_providers}" '
-    BEGIN {
-      in_providers = 0
-      providers_done = 0
-    }
-    /^proxy-providers:/ {
-      in_providers = 1
-      if (providers_done == 0) {
-        while ((getline line < new_providers) > 0) {
-          print line
-        }
-        close(new_providers)
-        providers_done = 1
-      }
-      next
-    }
-    in_providers == 1 && /^[a-zA-Z-]+:/ {
-      in_providers = 0
-      print
-      next
-    }
-    in_providers == 1 {
-      next
-    }
-    {
-      print
-    }
-    END {
-      if (providers_done == 0) {
-        while ((getline line < new_providers) > 0) {
-          print line
-        }
-        close(new_providers)
-      }
-    }
-  ' "${mihomo_config}" > "${temp_output}"
-  
-  mv "${temp_output}" "${mihomo_config}"
-  
-  rm -f "${temp_providers}"
-  
-  log Debug "proxy-providers 配置构建完成"
-  return 0
-}
-
 # 检查并更新订阅
 upsubs() {
   if [ "${update_subscription}" != "true" ]; then
@@ -531,7 +427,7 @@ upsubs() {
 
       local success_count=0
       local update_failed=false
-      local rules_extracted=false
+
 
       for i in $(seq 0 $((url_count - 1))); do
         local url="${subscription_url_mihomo[$i]}"
@@ -540,82 +436,10 @@ upsubs() {
         
         log Info "--> 正在处理订阅 #${i}: ${file_name}"
 
-        if [ "${renew}" = "true" ] && [ "$i" -eq 0 ]; then
-          log Info "检测到 renew=true, 仅使用第一个订阅链接更新"
-          if LOG_MASK_URL=mask upfile "${mihomo_config}" "${url}" "ClashMeta"; then
-            log Info "${mihomo_config} 更新成功"
-            if [ -f "${box_pid}" ]; then
-              kill -0 "$(<"${box_pid}" 2>/dev/null)" && \
-              $scripts_dir/box.service restart 2>/dev/null
-            fi
-            log Info "${bin_name} 订阅更新完成 → $(date)"
-            exit 0
-          else
-            log Error "${mihomo_config} 更新失败"
-            exit 1
-          fi
-        fi
-        
         if LOG_MASK_URL=mask upfile "${provider_file}" "${url}" "ClashMeta"; then
           log Debug "文件大小: $(wc -c < "${provider_file}" 2>/dev/null || echo "未知") 字节"
           log Debug "文件路径: ${provider_file}"
-          
-          local decoded_content
-          decoded_content=$(base64 -d "${provider_file}" 2>/dev/null)
-
-          if [ $? -eq 0 ] && echo "${decoded_content}" | grep -qE "vless://|vmess://|ss://|hysteria://|hysteria2://|anytls://|trojan://"; then
-            log Info "检测到 Base64 编码订阅, 正在解码..."
-            echo "${decoded_content}" > "${provider_file}"
-            local proxy_count=$(echo "${decoded_content}" | grep -cE "vless://|vmess://|ss://|hysteria://|hysteria2://|anytls://|trojan://")
-            log Debug "提取到 ${proxy_count} 个代理节点"
-            log Info "订阅 #${i} (Base64解码/原始链接) 已保存"
-            success_count=$((success_count + 1))
-          elif ${yq} 'has("proxies")' "${provider_file}" 2>/dev/null; then
-            if [ "${custom_rules_subs}" = "true" ] && [ "$rules_extracted" = "false" ]; then
-              if ${yq} 'has("rules")' "${provider_file}" &>/dev/null; then
-                log Info "在 ${file_name} 中找到规则, 正在提取..."
-                ${yq} '.rules' "${provider_file}" > "${mihomo_provide_rules}"
-                ${yq} -i '{"rules": .}' "${mihomo_provide_rules}"
-                log Info "规则已提取到 ${mihomo_provide_rules}"
-                rules_extracted=true
-              fi
-            fi
-
-            log Debug "标准订阅格式, 正在提取 proxies 并覆盖原文件..."
-            local temp_proxies_file
-            temp_proxies_file=$(mktemp)
-            
-            # 提取 proxies 数组并验证
-            log Debug "尝试提取 proxies 字段..."     
-            if ${yq} '.proxies' "${provider_file}" > "${temp_proxies_file}" 2>/dev/null; then
-              if [ -s "${temp_proxies_file}" ]; then
-                local proxy_count=$(${yq} 'length' "${temp_proxies_file}" 2>/dev/null || echo "0")
-                log Debug "提取到 ${proxy_count} 个代理节点"
-                ${yq} -i '{"proxies": .}' "${temp_proxies_file}"
-                mv "${temp_proxies_file}" "${provider_file}"
-                log Info "订阅 #${i} (标准格式) 已处理并保存"
-                success_count=$((success_count + 1))
-              else
-                log Error "订阅 #${i} (${file_name}) proxies 字段为空"
-                rm -f "${temp_proxies_file}" "${provider_file}"
-                update_failed=true
-              fi
-            else
-              log Error "订阅 #${i} (${file_name}) yq 提取 proxies 失败"
-              rm -f "${temp_proxies_file}" "${provider_file}"
-              update_failed=true
-            fi
-
-          elif ${yq} '.. | select(tag == "!!str")' "${provider_file}" 2>/dev/null | grep -qE "vless://|vmess://|ss://|hysteria://|hysteria2://|anytls://|trojan://"; then
-            local proxy_count=$(${yq} '.. | select(tag == "!!str")' "${provider_file}" 2>/dev/null | grep -cE "vless://|vmess://|ss://|hysteria://|hysteria2://|anytls://|trojan://")
-            log Debug "提取到 ${proxy_count} 个代理节点"
-            log Info "订阅 #${i} (原始链接) 已保存"
-            success_count=$((success_count + 1))
-          else
-            log Error "订阅 #${i} (${file_name}) 格式无法识别或内容为空, 已删除"
-            rm -f "${provider_file}"
-            update_failed=true
-          fi
+          success_count=$((success_count + 1))
         else
           log Error "订阅 #${i} (${file_name}) 下载失败"
           update_failed=true
@@ -623,19 +447,6 @@ upsubs() {
       done
 
       log Info "成功更新 ${success_count} / ${url_count} 个订阅"
-      
-      if [ "${renew}" != "true" ] && [ "${success_count}" -gt 0 ]; then
-        if [ "${auto_modify_config}" = "true" ]; then
-          log Info "正在更新 ${name_mihomo_config} 的 proxy-providers 配置..."
-          if update_mihomo_providers; then
-            log Info "proxy-providers 配置更新成功"
-          else
-            log Warning "proxy-providers 配置更新失败，请手动检查配置文件"
-          fi
-        else
-          log Info "auto_modify_config 未启用，跳过更新 proxy-providers 配置"
-        fi
-      fi
       
       if [ "${update_failed}" = "true" ]; then
         log Error "部分订阅链接更新失败"
@@ -1381,18 +1192,12 @@ case "$1" in
   geosub)
     upsubs || exit 1
     upgeox
-    if [ -f "${box_pid}" ]; then
-      kill -0 "$(<"${box_pid}" 2>/dev/null)" && reload
-    fi
     ;;
   geox|subs)
     if [ "$1" = "geox" ]; then
       upgeox
     else
       upsubs || exit 1
-    fi
-    if [ -f "${box_pid}" ]; then
-      kill -0 "$(<"${box_pid}" 2>/dev/null)" && reload
     fi
     ;;
   upkernel)
