@@ -101,6 +101,7 @@ box_bin_alive() {
 box_run_crontab() {
   pkill -f "busybox crond" >/dev/null 2>&1
   busybox crontab -c "${box_run}" -r
+  sleep 1
   echo "# root 的定时任务" > "${box_run}/root"
 
   if [ "${run_crontab}" = "true" ]; then
