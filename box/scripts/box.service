@@ -99,7 +99,7 @@ box_bin_alive() {
 }
 
 box_run_crontab() {
-  pkill -f "busybox crond" >/dev/null 2>&1
+  stop_cron
   busybox crontab -c "${box_run}" -r
   sleep 1
   echo "# root 的定时任务" > "${box_run}/root"
@@ -853,10 +853,11 @@ stop_box() {
 }
 
 stop_cron() {
-  if ! busybox pkill -f "busybox crond" >/dev/null 2>&1; then
-    cronkill=$(busybox pgrep -f "crond -c ${box_run}")
-    for cron in ${cronkill}; do
-      kill -15 "${cron}" >/dev/null 2>&1
+  local pids
+  if [ -n "${box_run}" ]; then
+    pids=$(busybox pgrep -f "crond -c ${box_run}")
+    for pid in $pids; do
+      kill -15 "$pid" >/dev/null 2>&1
     done
   fi
 }
