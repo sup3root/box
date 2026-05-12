@@ -6,7 +6,7 @@ user_agent="mihomo/1.19.17"
 source /data/adb/box/settings.ini
 
 # 使用 settings.ini 中提供的 log()
-TOOL_LOG="/data/adb/box/run/tool.log"
+TOOL_LOG="${box_run}/tool.log"
 busybox mkdir -p "$(dirname "$TOOL_LOG")"
 box_log="$TOOL_LOG"
 
@@ -388,6 +388,119 @@ upgeox_all() {
   bin_name=$original_bin_name
 }
 
+# 更新 mihomo 配置的 proxy-providers
+update_mihomo_providers() {
+  yq="yq"
+  if ! command -v yq &>/dev/null; then
+    if [ ! -e "${box_dir}/bin/yq" ]; then
+      log Debug "yq 文件未找到, 开始从 GitHub 下载"
+      ${scripts_dir}/box.tool upyq
+    fi
+    yq="${box_dir}/bin/yq"
+  fi
+
+  if [ ! -f "${mihomo_config}" ]; then
+    log Error "配置文件不存在: ${mihomo_config}"
+    return 1
+  fi
+  cp "${mihomo_config}" "${mihomo_config}.bak" 2>/dev/null
+  local file_count=${#name_provide_mihomo_config[@]}
+  if [ "$file_count" -eq 0 ]; then
+    log Warning "没有配置的订阅文件"
+    return 1
+  fi
+
+  log Debug "开始更新 proxy-providers 配置项..."
+  local config_dir="$(dirname "${mihomo_config}")"  
+  
+  local temp_providers="${mihomo_config}.providers.tmp"
+  echo "proxy-providers:" > "${temp_providers}"
+  
+  for i in $(seq 0 $((file_count - 1))); do
+    local file_name="${name_provide_mihomo_config[$i]}"
+    local provider_file="${mihomo_provide_path}/${file_name}"
+    local provider_name="${file_name%.yaml}"
+    local provider_url="${subscription_url_mihomo[$i]}"
+    local escaped_url
+
+    if [ -z "${provider_url}" ]; then
+      log Warning "订阅链接为空，跳过: ${provider_name}"
+      continue
+    fi
+    escaped_url="$(echo "${provider_url}" | busybox sed 's/\\/\\\\/g; s/\"/\\"/g')"
+    
+    local relative_path
+    if command -v realpath >/dev/null 2>&1 && [ -e "${provider_file}" ]; then
+      relative_path="$(realpath --relative-to="${config_dir}" "${provider_file}")"
+      [ -z "${relative_path}" ] && relative_path="./$(basename "${mihomo_provide_path}")/${file_name}"
+    else
+      relative_path="./$(basename "${mihomo_provide_path}")/${file_name}"
+    fi
+
+    log Debug "添加 provider: ${provider_name} -> ${relative_path} (http)"
+    
+    cat >> "${temp_providers}" <<EOF
+  ${provider_name}:
+    type: http
+    url: "${escaped_url}"
+    path: ${relative_path}
+    interval: 86400
+    health-check:
+      enable: true
+      url: https://cp.cloudflare.com
+      interval: 300
+      timeout: 1000
+      tolerance: 100
+EOF
+  done
+  
+  local temp_output="${mihomo_config}.output.tmp"
+  
+  awk -v new_providers="${temp_providers}" '
+    BEGIN {
+      in_providers = 0
+      providers_done = 0
+    }
+    /^proxy-providers:/ {
+      in_providers = 1
+      if (providers_done == 0) {
+        while ((getline line < new_providers) > 0) {
+          print line
+        }
+        close(new_providers)
+        providers_done = 1
+      }
+      next
+    }
+    in_providers == 1 && /^[a-zA-Z-]+:/ {
+      in_providers = 0
+      print
+      next
+    }
+    in_providers == 1 {
+      next
+    }
+    {
+      print
+    }
+    END {
+      if (providers_done == 0) {
+        while ((getline line < new_providers) > 0) {
+          print line
+        }
+        close(new_providers)
+      }
+    }
+  ' "${mihomo_config}" > "${temp_output}"
+  
+  mv "${temp_output}" "${mihomo_config}"
+  
+  rm -f "${temp_providers}"
+  
+  log Debug "proxy-providers 配置构建完成"
+  return 0
+}
+
 # 检查并更新订阅
 upsubs() {
   if [ "${update_subscription}" != "true" ]; then
@@ -498,9 +611,19 @@ upkernel() {
     return 1
   fi
 
+  local target_bin_name="${core_to_update}"
+  case "${core_to_update}" in
+    "mihomo_smart")
+      target_bin_name="mihomo"
+      ;;
+    "sing-box_ref1nd")
+      target_bin_name="sing-box"
+      ;;
+  esac
+
   mkdir -p "${bin_dir}/backup"
-  if [ -f "${bin_dir}/${core_to_update}" ]; then
-    cp "${bin_dir}/${core_to_update}" "${bin_dir}/backup/${core_to_update}.bak" >/dev/null 2>&1
+  if [ -f "${bin_dir}/${target_bin_name}" ]; then
+    cp "${bin_dir}/${target_bin_name}" "${bin_dir}/backup/${target_bin_name}.bak" >/dev/null 2>&1
   fi
   case $(uname -m) in
     "aarch64") 
@@ -542,6 +665,29 @@ upkernel() {
       
       log Debug "下载 ${download_link}"
       upfile "${box_dir}/${file_kernel}.gz" "${download_link}" && xkernel "$core_to_update" "" "" "" "$file_kernel"
+      ;;
+    "sing-box_ref1nd")
+      log Info "正在更新 sing-box reF1nd 核心"
+      local api_url="https://api.github.com/repos/reF1nd/sing-box-releases/releases"
+      local url_down="https://github.com/reF1nd/sing-box-releases/releases"
+
+      if [ "${singbox_stable}" = "disable" ]; then
+        log Debug "正在下载 ${core_to_update} 预发布版本"
+        latest_version=$($rev1 "${api_url}" | grep "tag_name" | busybox grep -oE "v[0-9].*" | head -1 | cut -d'"' -f1)
+      else
+        log Debug "正在下载 ${core_to_update} 最新稳定版本"
+        latest_version=$($rev1 "${api_url}/latest" | grep "tag_name" | busybox grep -oE "v[0-9].*" | head -1 | cut -d'"' -f1)
+      fi
+
+      if [ -z "$latest_version" ]; then
+        log Error "获取 sing-box reF1nd 最新版本失败"
+        return 1
+      fi
+
+      local file_kernel="${core_to_update}-${arch}"
+      local download_link="${url_down}/download/${latest_version}/sing-box-${latest_version#v}-${platform}-${arch}.tar.gz"
+      log Debug "下载 ${download_link}"
+      upfile "${box_dir}/${file_kernel}.tar.gz" "${download_link}" && xkernel "$core_to_update" "$platform" "$arch" "$latest_version" "$file_kernel"
       ;;
     "sing-box")
       api_url="https://api.github.com/repos/SagerNet/sing-box/releases"
@@ -665,6 +811,8 @@ xkernel() {
   local target_bin_name="$core_to_process"
   if [ "$core_to_process" = "mihomo_smart" ]; then
     target_bin_name="mihomo"
+  elif [ "$core_to_process" = "sing-box_ref1nd" ]; then
+    target_bin_name="sing-box"
   fi
   
   bin_name=$core_to_process
@@ -684,17 +832,17 @@ xkernel() {
         return 1
       fi
       ;;
-    "sing-box")
+    "sing-box"|"sing-box_ref1nd")
       tar_command="tar"
       if ! command -v tar >/dev/null; then
         tar_command="busybox tar"
       fi
       log Info "正在解压 Sing-Box 核心..."
       if ${tar_command} -xf "${box_dir}/${file_kernel}.tar.gz" -C "${bin_dir}" >/dev/null; then
-        mv "${bin_dir}/sing-box-${latest_version#v}-${platform}-${arch}/sing-box" "${bin_dir}/${core_to_process}"
+        mv "${bin_dir}/sing-box-${latest_version#v}-${platform}-${arch}/sing-box" "${bin_dir}/${target_bin_name}"
         if [ -f "${box_pid}" ]; then
           rm -rf /data/adb/box/sing-box/cache.db
-          restart_box "$core_to_process"
+          restart_box "$target_bin_name"
         else
           log Debug "${core_to_process} 无需重启."
         fi
