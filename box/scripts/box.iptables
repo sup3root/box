@@ -118,7 +118,7 @@ ensure_rule_insert() {
 is_box_custom_chain() {
   local chain_name="$1"
   case "${chain_name}" in
-    BOX_*|DIVERT|LOCAL_IP_V4|LOCAL_IP_V6|NAT_DNS_HIJACK|NAT_DNS_HIJACK6|NAT_DNS_FORWARD|NAT_DNS_FORWARD6|MIHOMO_DNS_EXTERNAL|MIHOMO_DNS_LOCAL|AP_* )
+    BOX_*|DIVERT|LOCAL_IP_V4|LOCAL_IP_V6|NAT_DNS_HIJACK|NAT_DNS_HIJACK6|NAT_DNS_HIJACK_PRE|NAT_DNS_HIJACK_OUT|NAT_DNS_HIJACK6_PRE|NAT_DNS_HIJACK6_OUT|NAT_DNS_FORWARD|NAT_DNS_FORWARD6|NAT_DNS_FORWARD_PRE|NAT_DNS_FORWARD_OUT|NAT_DNS_FORWARD6_PRE|NAT_DNS_FORWARD6_OUT|MIHOMO_DNS_EXTERNAL|MIHOMO_DNS_LOCAL|AP_* )
       return 0
       ;;
     *)
@@ -503,28 +503,70 @@ apply_capability_downgrades() {
   log_capabilities
 }
 
-setup_nat_dns_hijack() {
+append_nat_dns_redirect_rules() {
+  local chain_name="$1"
+  local dns_port="$2"
+  local include_tcp="$3"
+  local include_udp="$4"
+
+  if [ "${include_tcp}" = "true" ] && dns_tcp_enabled; then
+    ensure_rule_append nat "${chain_name}" -p tcp --dport 53 -j REDIRECT --to-ports "${dns_port}"
+  fi
+  if [ "${include_udp}" = "true" ] && dns_udp_enabled; then
+    ensure_rule_append nat "${chain_name}" -p udp --dport 53 -j REDIRECT --to-ports "${dns_port}"
+  fi
+}
+
+setup_nat_dns_prerouting_chain() {
   local chain_name="$1"
   local dns_port="$2"
   local family="$3"
+  local include_tcp="$4"
+  local include_udp="$5"
 
   ensure_chain nat "${chain_name}"
-  if ! add_core_bypass_rule nat "${chain_name}" -I; then
-    [ "${iptables}" = "$IPV" ] && log Warning "DNS 核心进程旁路失败，owner 匹配不可用，可能导致 DNS 回环。"
-  fi
+
+  # PREROUTING 处理外部/转发流量，不能使用 -m owner。
+  # owner match 只适用于 OUTPUT/POSTROUTING；如果放进被 PREROUTING 调用的链，
+  # 内核会返回 "owner match: used from hooks PREROUTING" 并导致 Invalid argument。
   if [ "${family}" = "4" ] && [ "${ignore_ap_list}" != "" ]; then
     for ignore in ${ignore_ap_list[@]} ; do
       ensure_rule_append nat "${chain_name}" -i "${ignore}" -j RETURN
     done
   fi
-  if dns_tcp_enabled; then
-    ensure_rule_append nat "${chain_name}" -p tcp --dport 53 -j REDIRECT --to-ports "${dns_port}"
-  fi
-  if dns_udp_enabled; then
-    ensure_rule_append nat "${chain_name}" -p udp --dport 53 -j REDIRECT --to-ports "${dns_port}"
-  fi
+
+  append_nat_dns_redirect_rules "${chain_name}" "${dns_port}" "${include_tcp}" "${include_udp}"
   ensure_jump nat PREROUTING "${chain_name}"
+}
+
+setup_nat_dns_output_chain() {
+  local chain_name="$1"
+  local dns_port="$2"
+  local include_tcp="$3"
+  local include_udp="$4"
+  local warning_text="$5"
+
+  ensure_chain nat "${chain_name}"
+
+  # OUTPUT 处理本机流量，可以使用 owner 匹配来旁路核心进程，避免 DNS 回环。
+  if ! add_core_bypass_rule nat "${chain_name}" -I; then
+    [ "${iptables}" = "$IPV" ] && log Warning "${warning_text}"
+  fi
+
+  append_nat_dns_redirect_rules "${chain_name}" "${dns_port}" "${include_tcp}" "${include_udp}"
   ensure_jump nat OUTPUT "${chain_name}"
+}
+
+setup_nat_dns_hijack() {
+  local chain_name="$1"
+  local dns_port="$2"
+  local family="$3"
+
+  # 拆分为 PREROUTING/OUTPUT 两条链：
+  # - PREROUTING 链不包含 -m owner，用于热点/转发/外部进入流量；
+  # - OUTPUT 链包含 -m owner，用于本机流量并旁路核心进程。
+  setup_nat_dns_prerouting_chain "${chain_name}_PRE" "${dns_port}" "${family}" true true
+  setup_nat_dns_output_chain "${chain_name}_OUT" "${dns_port}" true true "DNS 核心进程旁路失败，owner 匹配不可用，可能导致 DNS 回环。"
 }
 
 dns_mode_is_redirect() {
@@ -638,20 +680,10 @@ setup_nat_dns_forward() {
   local dns_port="$2"
   local family="$3"
 
-  ensure_chain nat "${chain_name}"
-  if ! add_core_bypass_rule nat "${chain_name}" -I; then
-    [ "${iptables}" = "$IPV" ] && log Warning "DNS 转发核心进程旁路失败，owner 匹配不可用，可能导致 DNS 回环。"
-  fi
-  if [ "${family}" = "4" ] && [ "${ignore_ap_list}" != "" ]; then
-    for ignore in ${ignore_ap_list[@]} ; do
-      ensure_rule_append nat "${chain_name}" -i "${ignore}" -j RETURN
-    done
-  fi
-  if dns_udp_enabled; then
-    ensure_rule_append nat "${chain_name}" -p udp --dport 53 -j REDIRECT --to-ports "${dns_port}"
-  fi
-  ensure_jump nat PREROUTING "${chain_name}"
-  ensure_jump nat OUTPUT "${chain_name}"
+  # mihomo_dns_forward 仅转发 UDP/53，同样需要拆分 PREROUTING/OUTPUT，
+  # 避免 -m owner 出现在 PREROUTING 调用路径里。
+  setup_nat_dns_prerouting_chain "${chain_name}_PRE" "${dns_port}" "${family}" false true
+  setup_nat_dns_output_chain "${chain_name}_OUT" "${dns_port}" false true "DNS 转发核心进程旁路失败，owner 匹配不可用，可能导致 DNS 回环。"
 }
 
 ensure_dns_nat_hijack() {
@@ -1177,21 +1209,28 @@ cleanup_quic_block_rules() {
   del_rule_silent filter OUTPUT -p udp --dport 80 -j REJECT
 }
 
+cleanup_dns_nat_pair() {
+  local base_chain="$1"
+
+  # 清理新版拆分链。
+  del_jump_silent nat PREROUTING "${base_chain}_PRE"
+  del_jump_silent nat OUTPUT "${base_chain}_OUT"
+  cleanup_chain_fast nat "${base_chain}_PRE"
+  cleanup_chain_fast nat "${base_chain}_OUT"
+
+  # 兼容清理旧版未拆分链，避免升级后残留规则。
+  del_jump_silent nat PREROUTING "${base_chain}"
+  del_jump_silent nat OUTPUT "${base_chain}"
+  cleanup_chain_fast nat "${base_chain}"
+}
+
 cleanup_dns_nat_hijack_chains() {
   if [ "${iptables}" = "$IPV" ]; then
-    del_jump_silent nat PREROUTING NAT_DNS_HIJACK
-    del_jump_silent nat OUTPUT NAT_DNS_HIJACK
-    cleanup_chain_fast nat NAT_DNS_HIJACK
-    del_jump_silent nat PREROUTING NAT_DNS_FORWARD
-    del_jump_silent nat OUTPUT NAT_DNS_FORWARD
-    cleanup_chain_fast nat NAT_DNS_FORWARD
+    cleanup_dns_nat_pair NAT_DNS_HIJACK
+    cleanup_dns_nat_pair NAT_DNS_FORWARD
   else
-    del_jump_silent nat PREROUTING NAT_DNS_HIJACK6
-    del_jump_silent nat OUTPUT NAT_DNS_HIJACK6
-    cleanup_chain_fast nat NAT_DNS_HIJACK6
-    del_jump_silent nat PREROUTING NAT_DNS_FORWARD6
-    del_jump_silent nat OUTPUT NAT_DNS_FORWARD6
-    cleanup_chain_fast nat NAT_DNS_FORWARD6
+    cleanup_dns_nat_pair NAT_DNS_HIJACK6
+    cleanup_dns_nat_pair NAT_DNS_FORWARD6
   fi
 }
 
